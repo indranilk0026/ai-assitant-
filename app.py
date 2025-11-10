@@ -79,27 +79,90 @@ FASHION_TRENDS = {
     'clean girl': ['slicked back', 'natural', 'minimalist', 'gold jewelry', 'simple']
 }
 
-# Load CLIP model
+# Load CLIP model (OpenAI CLIP or fallback to Hugging Face transformers)
 @st.cache_resource
 def load_clip_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, preprocess = clip.load("ViT-B/32", device=device)
-    return model, preprocess, device
+
+    # First try OpenAI's CLIP (clip.load)
+    try:
+        # If this raises AttributeError (or other), we'll fall back below
+        model, preprocess = clip.load("ViT-B/32", device=device)
+        return model, preprocess, device
+    except Exception:
+        # Try fallback to Hugging Face transformers' CLIP implementation
+        try:
+            from transformers import CLIPModel, CLIPProcessor
+
+            hf_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+            hf_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            hf_model.to(device)
+            return hf_model, hf_processor, device
+        except Exception as e:
+            # Neither OpenAI CLIP nor transformers CLIP are available/working
+            # Raise a clear error so the Streamlit UI can show instructions
+            raise RuntimeError(
+                "Failed to load CLIP. Install the official OpenAI CLIP or Hugging Face transformers. "
+                "For the OpenAI CLIP implementation run:\n"
+                "  pip uninstall clip -y; pip install git+https://github.com/openai/CLIP.git\n"
+                "Or install Hugging Face transformers:\n"
+                "  pip install transformers\n"
+                f"Underlying error: {e}"
+            )
 
 # Extract features from image
 def extract_image_features(image, model, preprocess, device):
-    image_input = preprocess(image).unsqueeze(0).to(device)
+    """
+    Support both OpenAI CLIP (model.encode_image + preprocess as torchvision transform)
+    and Hugging Face transformers (CLIPModel + CLIPProcessor).
+    """
+    # OpenAI CLIP path
+    if hasattr(model, "encode_image"):
+        image_input = preprocess(image).unsqueeze(0).to(device)
+        with torch.no_grad():
+            image_features = model.encode_image(image_input)
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+        return image_features.cpu().numpy()
+
+    # Hugging Face transformers path
+    # preprocess is a CLIPProcessor
+    inputs = preprocess(images=image, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
-        image_features = model.encode_image(image_input)
-        image_features /= image_features.norm(dim=-1, keepdim=True)
+        # CLIPModel.get_image_features expects pixel_values
+        image_features = model.get_image_features({k: v for k, v in inputs.items() if k == 'pixel_values'})
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
     return image_features.cpu().numpy()
 
 # Extract features from text
-def extract_text_features(text, model, device):
-    text_input = clip.tokenize([text]).to(device)
+def extract_text_features(text, model, preprocess, device):
+    """
+    Support both OpenAI CLIP (model.encode_text + clip.tokenize) and
+    Hugging Face transformers (CLIPModel + CLIPProcessor.tokenizer).
+    """
+    # OpenAI CLIP path
+    if hasattr(model, "encode_text"):
+        text_input = clip.tokenize([text]).to(device)
+        with torch.no_grad():
+            text_features = model.encode_text(text_input)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+        return text_features.cpu().numpy()
+
+    # Hugging Face transformers path
+    # preprocess here is expected to be a CLIPProcessor
+    # Use the processor to tokenize
+    try:
+        # processor = preprocess (CLIPProcessor)
+        inputs = preprocess(text=[text], return_tensors="pt", padding=True)
+    except Exception:
+        # If preprocess isn't a processor, fall back to raising a clear error
+        raise RuntimeError("Text preprocessing failed: CLIP processor/tokenizer not available.")
+
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
-        text_features = model.encode_text(text_input)
-        text_features /= text_features.norm(dim=-1, keepdim=True)
+        # CLIPModel.get_text_features expects input_ids and attention_mask
+        text_features = model.get_text_features({k: v for k, v in inputs.items() if k in ('input_ids', 'attention_mask')})
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
     return text_features.cpu().numpy()
 
 # Calculate similarity
@@ -266,7 +329,7 @@ def upload_page():
             
             # Item details form
             with st.form("item_details"):
-                st.write("**Add details for better recommendations:**")
+                st.write("*Add details for better recommendations:*")
                 
                 col_a, col_b = st.columns(2)
                 
@@ -362,7 +425,7 @@ def upload_page():
                 cat = item['category']
                 categories[cat] = categories.get(cat, 0) + 1
             
-            st.write("**By Category:**")
+            st.write("*By Category:*")
             for cat, count in categories.items():
                 st.write(f"• {cat.title()}: {count}")
             
@@ -440,7 +503,7 @@ def assistant_page():
                     st.markdown(f"<div class='chat-message ai-message'><strong>AI:</strong> {message['content']}</div>", unsafe_allow_html=True)
         
         # Suggestion chips
-        st.write("**Quick Questions:**")
+        st.write("*Quick Questions:*")
         col1, col2, col3, col4 = st.columns(4)
         
         suggestions = [
@@ -514,8 +577,8 @@ def assistant_page():
                     query_analysis = understand_query(query_input)
                     
                     # Show what AI understood
-                    st.info(f"AI Understanding: Looking for **{query_analysis['occasion']}** outfits" + 
-                           (f" with **{', '.join(query_analysis['trends'])}** style" if query_analysis['trends'] else ""))
+                    st.info(f"AI Understanding: Looking for *{query_analysis['occasion']}* outfits" + 
+                           (f" with *{', '.join(query_analysis['trends'])}* style" if query_analysis['trends'] else ""))
                     
                     # Get preferences
                     preferences = {
@@ -548,10 +611,10 @@ def assistant_page():
                                         img_data = base64.b64decode(item['image'])
                                         img = Image.open(io.BytesIO(img_data))
                                         st.image(img)
-                                        st.caption(f"**{item['category'].title()}**")
+                                        st.caption(f"{item['category'].title()}")
                                         st.caption(f"Match: {int(item['match_score'] * 100)}%")
                                         if item.get('description'):
-                                            st.caption(f"_{item['description'][:50]}_")
+                                            st.caption(f"{item['description'][:50]}")
                         
                         # Show top individual items
                         st.markdown("---")
@@ -575,5 +638,5 @@ def main():
     else:
         assistant_page()
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
