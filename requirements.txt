@@ -1,6 +1,6 @@
 streamlit
-torch==2.1.2
-torchvision==0.18.0
+torch
+torchvision
 clip-by-openai
 Pillow
 numpy
