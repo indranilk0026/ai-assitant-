@@ -4,3 +4,7 @@ torchvision
 clip-by-openai
 Pillow
 numpy
+ftfy
+regex
+tqdm
+git+https://github.com/openai/CLIP.git
